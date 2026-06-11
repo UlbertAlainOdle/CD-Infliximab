@@ -1,8 +1,6 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.calibration import calibration_curve
-from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -27,8 +25,8 @@ plt.rcParams['axes.linewidth'] = 1.5
 plt.rcParams['xtick.major.width'] = 1.5
 plt.rcParams['ytick.major.width'] = 1.5
 
-COLOR_PROPOSED = '#B22222'  # Firebrick
-COLOR_BASELINE = '#708090'  # SlateGray
+COLOR_PROPOSED = '#D55E00'  # Vermilion
+COLOR_BASELINE = '#7F7F7F'  # Gray
 COLOR_TREAT_ALL = '#4682B4'
 COLOR_TREAT_NONE = '#000000'
 
@@ -45,6 +43,7 @@ SELECTED_FEATURES_FILE = os.path.join(BASE_DIR, "selected_features.json")
 
 # --- Best Params ---
 BEST_PARAMS_PROPOSED = {'n_estimators': 137, 'max_depth': 10, 'learning_rate': 0.017444824475985048, 'subsample': 0.9997391245814459, 'colsample_bytree': 0.9415743112958483, 'gamma': 1.7483463681615965, 'min_child_weight': 2, 'reg_alpha': 0.04845238191904519, 'reg_lambda': 0.0121275899499253, 'scale_pos_weight': 4.045168009584749}
+
 
 # Feature Engineering Classes (must match exactly to load models properly, though we will also recreate OOF)
 class Winsorizer(BaseEstimator, TransformerMixin):
@@ -206,60 +205,6 @@ def calculate_net_benefit(y_true, y_prob, pt_arr):
         net_benefits.append(nb)
     return np.array(net_benefits)
 
-def calculate_ece(y_true, y_prob, n_bins=10):
-    prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy='uniform')
-    
-    # Calculate bin weights
-    bins = np.linspace(0., 1., n_bins + 1)
-    binids = np.digitize(y_prob, bins) - 1
-    bin_counts = np.bincount(binids, minlength=n_bins)
-    weights = bin_counts / len(y_prob)
-    
-    # Exclude empty bins
-    non_empty = bin_counts > 0
-    ece = np.sum(weights[non_empty] * np.abs(prob_true - prob_pred))
-    return ece
-
-def calibration_curve_with_ci(y_true, y_prob, n_bins=4, strategy='quantile', ci=0.95):
-    """Calculates calibration curve with Wilson score interval for binomial proportions."""
-    prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy=strategy)
-    
-    if strategy == 'quantile':
-        quantiles = np.linspace(0, 1, n_bins + 1)
-        bins = np.percentile(y_prob, quantiles * 100)
-        bins[-1] = bins[-1] + 1e-8
-    else:
-        bins = np.linspace(0., 1. + 1e-8, n_bins + 1)
-        
-    binids = np.digitize(y_prob, bins) - 1
-    bin_total = np.bincount(binids, minlength=len(bins))
-    
-    # Exclude empty bins to match calibration_curve output
-    non_empty = bin_total > 0
-    bin_total = bin_total[non_empty]
-    
-    # z-score for 95% CI is 1.96
-    z = 1.96
-    n = bin_total
-    p = prob_true
-    
-    # Wilson score interval
-    denominator = 1 + z**2 / n
-    centre_adjusted_prob = p + z**2 / (2 * n)
-    adjusted_standard_deviation = np.sqrt((p * (1 - p) + z**2 / (4 * n)) / n)
-    
-    lower_bound = (centre_adjusted_prob - z * adjusted_standard_deviation) / denominator
-    upper_bound = (centre_adjusted_prob + z * adjusted_standard_deviation) / denominator
-    
-    lower_bound = np.maximum(0, lower_bound)
-    upper_bound = np.minimum(1, upper_bound)
-    
-    # Return yerr for plotting
-    yerr_lower = np.maximum(0, p - lower_bound)
-    yerr_upper = np.maximum(0, upper_bound - p)
-    
-    return prob_pred, prob_true, [yerr_lower, yerr_upper]
-
 def main():
     print("Loading data...")
     X_raw, y = load_data(TRAIN_FILE)
@@ -311,16 +256,6 @@ def main():
         clf_prop = XGBClassifier(**BEST_PARAMS_PROPOSED, random_state=42, n_jobs=1)
         clf_prop.fit(X_tr_proc, y_tr)
         oof_proposed_probs[val_idx] = clf_prop.predict_proba(X_val_proc)[:, 1]
-        
-        # Baseline OOF
-        # Needs simple imputation and standard scaler
-        from sklearn.preprocessing import StandardScaler
-        base_pipe = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler()) # Assuming it uses scaler, wait baseline is XGBoost! Usually no scaler needed, but let's check baseline_best_model
-        ])
-        # To be perfectly safe, I'll just use the baseline_model directly on CV or wait, baseline XGB doesn't strictly need scaler
-        pass
 
     # For Baseline OOF, instantiate a fresh model using the best params
     with open(os.path.join(BASE_DIR, "baseline_best_params.json"), "r") as f:
@@ -350,77 +285,34 @@ def main():
     X_ext_imputed = imputer_ext.transform(X_ext)
     ext_baseline_probs = baseline_model.predict_proba(X_ext_imputed)[:, 1]
     
-    # --- Metrics Calculation ---
-    print("\nMetrics:")
-    print(f"Internal Proposed Brier: {brier_score_loss(y_train, oof_proposed_probs):.4f}, ECE: {calculate_ece(y_train, oof_proposed_probs):.4f}")
-    print(f"External Proposed Brier: {brier_score_loss(y_ext, ext_proposed_probs):.4f}, ECE: {calculate_ece(y_ext, ext_proposed_probs):.4f}")
-    print(f"External Baseline Brier: {brier_score_loss(y_ext, ext_baseline_probs):.4f}, ECE: {calculate_ece(y_ext, ext_baseline_probs):.4f}")
-
     # --- Plotting ---
-    fig = plt.figure(figsize=(16, 14))
-    
-    # A: Calibration (Internal)
-    ax1 = plt.subplot(2, 2, 1)
-    ax1.plot([0, 1], [0, 1], "k:", label="Perfectly Calibrated")
-    
-    # 5 bins for internal OOF
-    prob_pred_int, prob_true_int, yerr_int = calibration_curve_with_ci(y_train, oof_proposed_probs, n_bins=4, strategy='quantile')
-    ax1.plot(prob_pred_int, prob_true_int, "s-", color=COLOR_PROPOSED, label="Proposed Model (OOF)", linewidth=2, markersize=8)
-    ax1.errorbar(prob_pred_int, prob_true_int, yerr=yerr_int, fmt="none", ecolor=COLOR_PROPOSED, 
-                 elinewidth=2, alpha=0.2, capsize=0)
-                 
-    ax1.set_xlabel("Mean Predicted Probability", fontweight='bold')
-    ax1.set_ylabel("Fraction of Positives", fontweight='bold')
-    ax1.set_title("A. Calibration Curve (Development Set OOF)", fontweight='bold')
-    ax1.legend(loc="lower right")
-    ax1.grid(True, linestyle='--', alpha=0.6)
-    
-    # B: Calibration (External)
-    ax2 = plt.subplot(2, 2, 2)
-    ax2.plot([0, 1], [0, 1], "k:", label="Perfectly Calibrated")
-    
-    # 5 bins for external to reduce noise and keep bins populated
-    prob_pred_ext, prob_true_ext, yerr_ext = calibration_curve_with_ci(y_ext, ext_proposed_probs, n_bins=4, strategy='quantile')
-    ax2.plot(prob_pred_ext, prob_true_ext, "s-", color=COLOR_PROPOSED, label="Proposed Model", linewidth=2, markersize=8)
-    ax2.errorbar(prob_pred_ext, prob_true_ext, yerr=yerr_ext, fmt="none", ecolor=COLOR_PROPOSED, 
-                 elinewidth=2, alpha=0.3, capsize=0)
-    
-    prob_pred_base, prob_true_base, yerr_base = calibration_curve_with_ci(y_ext, ext_baseline_probs, n_bins=4, strategy='quantile')
-    ax2.plot(prob_pred_base, prob_true_base, "^--", color=COLOR_BASELINE, label="Raw XGBoost", linewidth=2, markersize=8)
-    ax2.errorbar(prob_pred_base, prob_true_base, yerr=yerr_base, fmt="none", ecolor=COLOR_BASELINE, 
-                 elinewidth=2, alpha=0.3, capsize=0)
-                 
-    ax2.set_xlabel("Mean Predicted Probability", fontweight='bold')
-    ax2.set_ylabel("Fraction of Positives", fontweight='bold')
-    ax2.set_title("B. Calibration Curve (External Validation)", fontweight='bold')
-    ax2.legend(loc="lower right")
-    ax2.grid(True, linestyle='--', alpha=0.6)
+    fig = plt.figure(figsize=(16, 7))
     
     # DCA Setup
     pt_arr = np.linspace(0.01, 0.99, 100)
     
-    # C: DCA (Internal)
-    ax3 = plt.subplot(2, 2, 3)
+    # A: DCA (Internal)
+    ax1 = plt.subplot(1, 2, 1)
     nb_proposed_int = calculate_net_benefit(y_train, oof_proposed_probs, pt_arr)
     # Apply Gaussian smoothing to internal DCA
     nb_proposed_int_smooth = gaussian_filter1d(nb_proposed_int, sigma=2)
     
     nb_all_int = calculate_net_benefit(y_train, np.ones(len(y_train)), pt_arr)
     
-    ax3.plot(pt_arr, nb_proposed_int_smooth, color=COLOR_PROPOSED, label="Proposed Model (OOF)", linewidth=2.5)
-    ax3.plot(pt_arr, nb_all_int, color=COLOR_TREAT_ALL, label="Treat All", linestyle='-.', linewidth=2)
-    ax3.plot(pt_arr, np.zeros_like(pt_arr), color=COLOR_TREAT_NONE, label="Treat None", linestyle='-', linewidth=2)
+    ax1.plot(pt_arr, nb_proposed_int_smooth, color=COLOR_PROPOSED, label="Proposed Model (OOF)", linestyle='-', linewidth=2.4)
+    ax1.plot(pt_arr, nb_all_int, color=COLOR_TREAT_ALL, label="Treat All", linestyle='-.', linewidth=2)
+    ax1.plot(pt_arr, np.zeros_like(pt_arr), color=COLOR_TREAT_NONE, label="Treat None", linestyle='-', linewidth=2)
     
-    ax3.set_xlim(0, 0.7)
-    ax3.set_ylim(-0.1, 0.6)
-    ax3.set_xlabel("Threshold Probability", fontweight='bold')
-    ax3.set_ylabel("Net Benefit", fontweight='bold')
-    ax3.set_title("C. Decision Curve Analysis (Development Set OOF)", fontweight='bold')
-    ax3.legend(loc="lower left")
-    ax3.grid(True, linestyle='--', alpha=0.6)
+    ax1.set_xlim(0, 0.7)
+    ax1.set_ylim(-0.1, 0.6)
+    ax1.set_xlabel("Threshold Probability", fontweight='bold')
+    ax1.set_ylabel("Net Benefit", fontweight='bold')
+    ax1.set_title("Decision Curve Analysis (Internal)", fontweight='bold')
+    ax1.legend(loc="lower left")
+    ax1.grid(True, linestyle='--', alpha=0.6)
     
-    # D: DCA (External)
-    ax4 = plt.subplot(2, 2, 4)
+    # B: DCA (External)
+    ax2 = plt.subplot(1, 2, 2)
     nb_proposed_ext = calculate_net_benefit(y_ext, ext_proposed_probs, pt_arr)
     nb_baseline_ext = calculate_net_benefit(y_ext, ext_baseline_probs, pt_arr)
     
@@ -430,23 +322,25 @@ def main():
     
     nb_all_ext = calculate_net_benefit(y_ext, np.ones(len(y_ext)), pt_arr)
     
-    ax4.plot(pt_arr, nb_proposed_ext_smooth, color=COLOR_PROPOSED, label="Proposed Model", linewidth=2.5)
-    ax4.plot(pt_arr, nb_baseline_ext_smooth, color=COLOR_BASELINE, label="Raw XGBoost", linestyle='--', linewidth=2.5)
-    ax4.plot(pt_arr, nb_all_ext, color=COLOR_TREAT_ALL, label="Treat All", linestyle='-.', linewidth=2)
-    ax4.plot(pt_arr, np.zeros_like(pt_arr), color=COLOR_TREAT_NONE, label="Treat None", linestyle='-', linewidth=2)
+    ax2.plot(pt_arr, nb_proposed_ext_smooth, color=COLOR_PROPOSED, label="Proposed Model", linestyle='-', linewidth=2.4)
+    ax2.plot(pt_arr, nb_baseline_ext_smooth, color=COLOR_BASELINE, label="Raw XGBoost", linestyle=':', linewidth=2.0)
+    ax2.plot(pt_arr, nb_all_ext, color=COLOR_TREAT_ALL, label="Treat All", linestyle='-.', linewidth=2)
+    ax2.plot(pt_arr, np.zeros_like(pt_arr), color=COLOR_TREAT_NONE, label="Treat None", linestyle='-', linewidth=2)
     
-    ax4.set_xlim(0, 0.8)
-    ax4.set_ylim(-0.1, 0.8)
-    ax4.set_xlabel("Threshold Probability", fontweight='bold')
-    ax4.set_ylabel("Net Benefit", fontweight='bold')
-    ax4.set_title("D. Decision Curve Analysis (External Validation)", fontweight='bold')
-    ax4.legend(loc="lower left")
-    ax4.grid(True, linestyle='--', alpha=0.6)
+    ax2.set_xlim(0, 0.8)
+    ax2.set_ylim(-0.1, 0.8)
+    ax2.set_xlabel("Threshold Probability", fontweight='bold')
+    ax2.set_ylabel("Net Benefit", fontweight='bold')
+    ax2.set_title("Decision Curve Analysis (External)", fontweight='bold')
+    ax2.legend(loc="lower left")
+    ax2.grid(True, linestyle='--', alpha=0.6)
     
     plt.tight_layout()
-    save_path = os.path.join(BASE_DIR, "calibration_dca_curves.png")
+    save_path = os.path.join(BASE_DIR, "dca_curves_only.png")
+    save_path_pdf = os.path.join(BASE_DIR, "dca_curves_only.pdf")
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\nSaved combined plots to {save_path}")
+    plt.savefig(save_path_pdf, bbox_inches='tight')
+    print(f"\nSaved DCA plots to {save_path} and {save_path_pdf}")
     
 if __name__ == "__main__":
     main()

@@ -4,7 +4,7 @@ import numpy as np
 import xgboost as xgb
 from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split, RepeatedStratifiedKFold, cross_validate
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, average_precision_score, precision_score, recall_score, precision_recall_curve, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, average_precision_score, precision_score, recall_score, precision_recall_curve, confusion_matrix, make_scorer
 from sklearn.preprocessing import RobustScaler, PolynomialFeatures, PowerTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -266,10 +266,37 @@ def main():
     cv_clf = XGBClassifier(**BEST_PARAMS, **_gpu_params())
     rskf = RepeatedStratifiedKFold(n_splits=10, n_repeats=10, random_state=42)
     
+    def sensitivity_score(y_true, y_pred):
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        return tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+    def specificity_score(y_true, y_pred):
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        return tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    def ppv_score(y_true, y_pred):
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        return tp / (tp + fp) if (tp + fp) > 0 else 0.0
+
+    def npv_score(y_true, y_pred):
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        return tn / (tn + fn) if (tn + fn) > 0 else 0.0
+
+    scoring = {
+        'f1': 'f1',
+        'roc_auc': 'roc_auc',
+        'average_precision': 'average_precision',
+        'accuracy': 'accuracy',
+        'sensitivity': make_scorer(sensitivity_score),
+        'specificity': make_scorer(specificity_score),
+        'ppv': make_scorer(ppv_score),
+        'npv': make_scorer(npv_score)
+    }
+
     cv_scores = cross_validate(
         cv_clf, X_train_final, y_train, 
         cv=rskf, 
-        scoring=['f1', 'roc_auc', 'average_precision', 'accuracy', 'precision', 'recall'], 
+        scoring=scoring, 
         n_jobs=1
     )
     
@@ -278,11 +305,13 @@ def main():
     print(f"   - F1 : {cv_scores['test_f1'].mean():.4f} ± {cv_scores['test_f1'].std():.4f}")
     print(f"   - AP : {cv_scores['test_average_precision'].mean():.4f} ± {cv_scores['test_average_precision'].std():.4f}")
     print(f"   - Acc: {cv_scores['test_accuracy'].mean():.4f} ± {cv_scores['test_accuracy'].std():.4f}")
-    print(f"   - Precision: {cv_scores['test_precision'].mean():.4f} ± {cv_scores['test_precision'].std():.4f}")
-    print(f"   - Recall: {cv_scores['test_recall'].mean():.4f} ± {cv_scores['test_recall'].std():.4f}")
+    print(f"   - Sensitivity: {cv_scores['test_sensitivity'].mean():.4f} ± {cv_scores['test_sensitivity'].std():.4f}")
+    print(f"   - Specificity: {cv_scores['test_specificity'].mean():.4f} ± {cv_scores['test_specificity'].std():.4f}")
+    print(f"   - PPV: {cv_scores['test_ppv'].mean():.4f} ± {cv_scores['test_ppv'].std():.4f}")
+    print(f"   - NPV: {cv_scores['test_npv'].mean():.4f} ± {cv_scores['test_npv'].std():.4f}")
 
     # 4. Train Model
-    print("Training XGBoost with best parameters...")
+    print("\nTraining XGBoost with best parameters...")
     final_clf = XGBClassifier(**BEST_PARAMS, **_gpu_params())
     final_clf.fit(X_train_final, y_train)
     
@@ -292,7 +321,7 @@ def main():
     print(f"\nOptimal Threshold (from Train): {best_thr:.4f}")
     
     # 6. Evaluate on Test
-    print("Evaluating on Holdout Test Set...")
+    print("\nEvaluating on Holdout Test Set...")
     X_test_processed_np = pre_pipeline.transform(X_test)
     X_test_processed = pd.DataFrame(X_test_processed_np, columns=final_feats, index=X_test.index)
     X_test_final = X_test_processed[selected_features]
@@ -304,17 +333,22 @@ def main():
     f1 = f1_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_prob)
     ap = average_precision_score(y_test, y_prob)
-    prec = precision_score(y_test, y_pred)
-    rec = recall_score(y_test, y_pred)
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0
     
-    print("\n===== Reproduction Results =====")
+    print("\n===== Internal Testing Results =====")
     print(f"Accuracy: {acc:.4f}")
     print(f"F1 Score: {f1:.4f}")
     print(f"AUC: {auc:.4f}")
     print(f"AP: {ap:.4f}")
-    print(f"Precision: {prec:.4f}")
-    print(f"Recall: {rec:.4f}")
-    print(f"Confusion Matrix:\n{confusion_matrix(y_test, y_pred)}")
+    print(f"Sensitivity: {sens:.4f}")
+    print(f"Specificity: {spec:.4f}")
+    print(f"PPV: {ppv:.4f}")
+    print(f"NPV: {npv:.4f}")
+    print(f"Confusion Matrix:\n{confusion_matrix(y_test, y_pred, labels=[0, 1])}")
     
     # Save Model
     joblib.dump(final_clf, "reproduced_best_model.joblib")
@@ -339,17 +373,22 @@ def main():
             f1_ext = f1_score(y_ext, y_ext_pred)
             auc_ext = roc_auc_score(y_ext, y_ext_prob)
             ap_ext = average_precision_score(y_ext, y_ext_prob)
-            prec_ext = precision_score(y_ext, y_ext_pred)
-            rec_ext = recall_score(y_ext, y_ext_pred)
+            tn_ext, fp_ext, fn_ext, tp_ext = confusion_matrix(y_ext, y_ext_pred, labels=[0, 1]).ravel()
+            sens_ext = tp_ext / (tp_ext + fn_ext) if (tp_ext + fn_ext) > 0 else 0.0
+            spec_ext = tn_ext / (tn_ext + fp_ext) if (tn_ext + fp_ext) > 0 else 0.0
+            ppv_ext = tp_ext / (tp_ext + fp_ext) if (tp_ext + fp_ext) > 0 else 0.0
+            npv_ext = tn_ext / (tn_ext + fn_ext) if (tn_ext + fn_ext) > 0 else 0.0
             
             print("\n===== External Verification Results =====")
             print(f"Accuracy: {acc_ext:.4f}")
             print(f"F1 Score: {f1_ext:.4f}")
             print(f"AUC: {auc_ext:.4f}")
             print(f"AP: {ap_ext:.4f}")
-            print(f"Precision: {prec_ext:.4f}")
-            print(f"Recall: {rec_ext:.4f}")
-            print(f"Confusion Matrix:\n{confusion_matrix(y_ext, y_ext_pred)}")
+            print(f"Sensitivity: {sens_ext:.4f}")
+            print(f"Specificity: {spec_ext:.4f}")
+            print(f"PPV: {ppv_ext:.4f}")
+            print(f"NPV: {npv_ext:.4f}")
+            print(f"Confusion Matrix:\n{confusion_matrix(y_ext, y_ext_pred, labels=[0, 1])}")
             
         except Exception as e:
             print(f"[ERROR] Failed to process external file: {e}")
